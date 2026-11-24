@@ -5,6 +5,7 @@ import os
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -45,7 +46,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", secrets.token_urlsafe(32))
 PROXY_URL = os.getenv("PROXY_URL")
 YTDLP_VERBOSE = os.getenv("YTDLP_VERBOSE", "0") == "1"
 
-# Optional cookies path (not required anymore; kept only for optional private/age-gated fallback)
+# Optional cookies path (not required; kept only for private/age-gated fallback)
 COOKIE_FILE = os.getenv("COOKIE_FILE", "/etc/secrets/youtube_cookies.txt")
 
 # PO Token (bgutil) HTTP Server configuration
@@ -65,7 +66,7 @@ _pot_process: subprocess.Popen | None = None
 
 
 # ==============================================================================
-# Deno & bgutil PO Token Server Management
+# Runtime Discovery & bgutil PO Token Server Management
 # ==============================================================================
 def find_deno() -> str | None:
     """Locate the Deno binary across common local and Render paths."""
@@ -82,7 +83,13 @@ def find_deno() -> str | None:
     return None
 
 
+def find_node() -> str | None:
+    """Locate the Node.js binary."""
+    return os.getenv("NODE_BIN") or shutil.which("node")
+
+
 DENO_PATH = find_deno()
+NODE_PATH = find_node()
 
 
 def is_pot_server_alive(timeout: float = 1.5) -> bool:
@@ -95,21 +102,49 @@ def is_pot_server_alive(timeout: float = 1.5) -> bool:
 
 
 def start_pot_server() -> bool:
-    """Start the bgutil Deno HTTP server on 127.0.0.1:4416 if not already running."""
+    """Start the bgutil HTTP server on 127.0.0.1:4416 (prefers prebuilt Node.js)."""
     global _pot_process
 
     if is_pot_server_alive():
         return True
 
-    if not DENO_PATH:
-        logger.warning("Deno binary not found; cannot start bgutil PO Token server.")
-        return False
-
+    node_build_js = BGUTIL_SERVER_DIR / "build" / "main.js"
+    deno_src_ts = BGUTIL_SERVER_DIR / "src" / "main.ts"
     node_modules_dir = BGUTIL_SERVER_DIR / "node_modules"
-    src_main = BGUTIL_SERVER_DIR / "src" / "main.ts"
-    if not node_modules_dir.is_dir() or not src_main.is_file():
+
+    cmd: list[str] | None = None
+    cwd: str = str(BGUTIL_SERVER_DIR)
+
+    if NODE_PATH and node_build_js.is_file():
+        cmd = [
+            NODE_PATH,
+            str(node_build_js),
+            "--host",
+            POT_SERVER_HOST,
+            "--port",
+            str(POT_SERVER_PORT),
+        ]
+    elif DENO_PATH and node_modules_dir.is_dir() and deno_src_ts.is_file():
+        cwd = str(node_modules_dir)
+        cmd = [
+            DENO_PATH,
+            "run",
+            "--allow-env",
+            "--allow-net",
+            "--allow-ffi=.",
+            "--allow-read=.",
+            "../src/main.ts",
+            "--host",
+            POT_SERVER_HOST,
+            "--port",
+            str(POT_SERVER_PORT),
+        ]
+
+    if not cmd:
         logger.warning(
-            "bgutil-server directory not found at %s; PO Token server disabled.",
+            "bgutil-server not built or runtime missing (node=%s, deno=%s, dir=%s).",
+            NODE_PATH,
+            DENO_PATH,
             BGUTIL_SERVER_DIR,
         )
         return False
@@ -128,40 +163,26 @@ def start_pot_server() -> bool:
         env["HTTPS_PROXY"] = PROXY_URL
         env["ALL_PROXY"] = PROXY_URL
 
-    cmd = [
-        DENO_PATH,
-        "run",
-        "--allow-env",
-        "--allow-net",
-        "--allow-ffi=.",
-        "--allow-read=.",
-        "../src/main.ts",
-        "--host",
-        POT_SERVER_HOST,
-        "--port",
-        str(POT_SERVER_PORT),
-    ]
-
-    logger.info("Starting bgutil PO Token HTTP server on %s...", POT_SERVER_URL)
+    logger.info("Starting bgutil PO Token HTTP server (%s)...", cmd[0])
     _pot_process = subprocess.Popen(
         cmd,
-        cwd=str(node_modules_dir),
+        cwd=cwd,
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
     )
 
-    for _ in range(25):
+    for _ in range(40):
         if is_pot_server_alive(timeout=1.0):
-            logger.info("bgutil PO Token HTTP server is ready.")
+            logger.info("bgutil PO Token HTTP server is ready on %s.", POT_SERVER_URL)
             return True
         if _pot_process.poll() is not None:
-            err_output = ""
-            if _pot_process.stderr:
-                err_output = _pot_process.stderr.read().decode("utf-8", errors="ignore")
-            logger.error("bgutil PO Token server exited prematurely: %s", err_output[:500])
+            logger.error(
+                "bgutil PO Token server exited prematurely with code %s.",
+                _pot_process.returncode,
+            )
             return False
-        time.sleep(0.4)
+        time.sleep(0.5)
 
     logger.warning("Timed out waiting for bgutil PO Token server /ping.")
     return False
@@ -338,7 +359,6 @@ def download_media(url: str, quality: str, folder: str) -> str:
             return str(downloaded)
         except Exception as exc:
             last_error = exc
-            # Clean partial files before fallback retry
             for leftover in Path(folder).iterdir():
                 if leftover.is_file() and leftover.name != "cookies.txt":
                     leftover.unlink(missing_ok=True)
@@ -473,6 +493,7 @@ def main() -> None:
     pot_ready = start_pot_server()
 
     logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
+    logger.info("Node path: %s", NODE_PATH)
     logger.info("Deno path: %s", DENO_PATH)
     logger.info("bgutil PO Token server ready: %s (%s)", pot_ready, POT_SERVER_URL)
     logger.info("Proxy configured: %s", bool(PROXY_URL))
